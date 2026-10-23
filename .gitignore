@@ -1,0 +1,57 @@
+.DS_Store
+
+# ローカルの署名証明書
+*.p12
+*.pfx
+
+# ローカルのビルド成果物・退避データ
+*.app/
+**/.build/
+**/build/
+**/Backups/
+Shared/Backups/Build/
+Shared/Backups/HIG/
+Shared/Backups/WindowChrome/
+Shared/Certificates/
+Shared/DistributionArchive/
+**/ReleaseArchive/
+
+# 公開リポジトリに含めないもの（2026-10-07）
+# 申請資料・個人用の記録・未公開原稿
+Shared/AppStore/
+Shared/SubmissionPreparation-*/
+Shared/OrganizationLogs/
+Shared/NoteDrafts/
+Unsorted/
+*/Publication/
+# 第三者バイナリ・大容量ファイル（ビルド時に各自取得）
+Shared/Updater/vendor/
+**/Vendor/
+**/pandoc-*-source.tar.gz
+# 生成物・キャッシュ
+**/outputs/
+**/work/
+*.pcm
+*.zip
+*.pkg
+*.dmg
+*.dSYM/
+Shared/BuildBackups/
+*競合コピー*
+# 作業記録・検証の生成物（2026-10-10）
+*.log
+Shared/BuildTools/Verification-*/
+Shared/BuildTools/deployment-*.json
+Shared/BuildTools/Logs/
+Shared/ReleasePreparation/
+PDF2Keynote/Tests/KeynoteOutput/
+
+# Per-Mac build and shared distribution paths
+.local/
+
+# 公開対象外の配布記録・申請用の生成資料
+/PodiumAssist/Release/
+/output/
+
+**/__pycache__/
+*.pyc
