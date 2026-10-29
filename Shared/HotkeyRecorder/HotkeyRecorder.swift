@@ -200,7 +200,11 @@ final class HotkeyRecorder: ObservableObject {
 @MainActor
 final class HotkeySet {
     var action: ((UInt32) -> Void)?
-    private let signature: OSType
+    /// Opt-in edge callbacks; existing clients keep their repeated press behavior.
+    var released: ((UInt32) -> Void)?
+    var suppressRepeatedPresses = false
+    private var held: Set<UInt32> = []
+    private nonisolated let signature: OSType
     private var references: [UInt32: EventHotKeyRef] = [:]
     private var wanted: [UInt32: KeyCombo] = [:]
     private var handler: EventHandlerRef?
@@ -210,19 +214,31 @@ final class HotkeySet {
     /// signature: four characters unique to the app, e.g. "LkMk".
     init(signature: String) {
         self.signature = signature.utf8.reduce(0) { ($0 << 8) | OSType($1) }
-        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        var specs = [kEventHotKeyPressed, kEventHotKeyReleased].map { EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32($0)) }
         handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
             guard let context, let event else { return OSStatus(eventNotHandledErr) }
             var id = EventHotKeyID()
             guard GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
                                     MemoryLayout<EventHotKeyID>.size, nil, &id) == noErr else { return OSStatus(eventNotHandledErr) }
             let owner = Unmanaged<HotkeySet>.fromOpaque(context).takeUnretainedValue()
-            let number = id.id, signature = id.signature
+            // Another HotkeySet of the same app (e.g. the app hotkey and the feature hotkeys) gets the event next.
+            // Returning noErr here would swallow its keys: the handler installed last is called first.
+            guard id.signature == owner.signature else { return OSStatus(eventNotHandledErr) }
+            let number = id.id
+            let isRelease = GetEventKind(event) == UInt32(kEventHotKeyReleased)
             DispatchQueue.main.async {
-                MainActor.assumeIsolated { if signature == owner.signature { owner.action?(number) } }
+                MainActor.assumeIsolated {
+                    if isRelease {
+                        owner.held.remove(number)
+                        owner.released?(number)
+                    } else {
+                        let first = owner.held.insert(number).inserted
+                        if first || !owner.suppressRepeatedPresses { owner.action?(number) }
+                    }
+                }
             }
             return noErr
-        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
+        }, specs.count, &specs, Unmanaged.passUnretained(self).toOpaque(), &handler)
         HotkeyRecorder.shared.onRecordingChanged.append { [weak self] recording in self?.setSuspended(recording) }
     }
 
@@ -250,6 +266,7 @@ final class HotkeySet {
         return status
     }
     private func detach(_ number: UInt32) {
+        held.remove(number)
         if let reference = references.removeValue(forKey: number) { UnregisterEventHotKey(reference) }
     }
     private func setSuspended(_ value: Bool) {
@@ -260,7 +277,7 @@ final class HotkeySet {
     }
 }
 
-/// One hotkey row: [key] [変更…] [初期値に戻す] [割り当てを解除], with the message underneath.
+/// One hotkey row: [clickable key] [初期値に戻す] [割り当てを解除], with the message underneath.
 /// `others` are the app's other hotkeys (title, combo) so the same key is not assigned twice.
 struct HotkeyField: View {
     let id: String
@@ -273,15 +290,24 @@ struct HotkeyField: View {
     var isEnabled = true
     /// Admit ⌥ / ⌥⇧ alone (only for apps whose own defaults use them).
     var allowsOption = false
+    var alignsColumns = false
     @ObservedObject private var recorder = HotkeyRecorder.shared
 
     init(id: String, combo: Binding<KeyCombo?>, defaultCombo: KeyCombo? = nil, allowsClear: Bool = false,
-         others: [(String, KeyCombo)] = [], registered: Bool = true, isEnabled: Bool = true, allowsOption: Bool = false) {
+         others: [(String, KeyCombo)] = [], registered: Bool = true, isEnabled: Bool = true, allowsOption: Bool = false, alignsColumns: Bool = false) {
         self.id = id; _combo = combo; self.defaultCombo = defaultCombo; self.allowsClear = allowsClear
-        self.others = others; self.registered = registered; self.isEnabled = isEnabled; self.allowsOption = allowsOption
+        self.others = others; self.registered = registered; self.isEnabled = isEnabled; self.allowsOption = allowsOption; self.alignsColumns = alignsColumns
     }
 
     private var recording: Bool { recorder.recordingID == id }
+    private func toggleRecording() {
+        recorder.start(id, allowsOption: allowsOption) { candidate in
+            if let owner = others.first(where: { $0.1 == candidate })?.0 { return HotkeyText.duplicate(candidate.label, owner) }
+            combo = candidate
+            recorder.touch()
+            return nil
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
@@ -291,18 +317,17 @@ struct HotkeyField: View {
                     .kerning(recording || combo == nil ? 0 : 2)
                     .foregroundColor(combo == nil && !recording ? .secondary : .primary)
                     .lineLimit(1).fixedSize()
-                    .frame(minWidth: 96, alignment: .leading)
+                    .frame(minWidth: 96, maxWidth: alignsColumns ? 96 : nil, alignment: .leading)
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(RoundedRectangle(cornerRadius: 4).stroke(recording ? Color.accentColor : Color.secondary.opacity(0.4)))
                     .accessibilityLabel(combo?.label ?? HotkeyText.unset)
-                Button(recording ? HotkeyText.cancel : HotkeyText.change) {
-                    recorder.start(id, allowsOption: allowsOption) { candidate in
-                        if let owner = others.first(where: { $0.1 == candidate })?.0 { return HotkeyText.duplicate(candidate.label, owner) }
-                        combo = candidate
-                        recorder.touch()
-                        return nil
-                    }
-                }
+                    // Clicking the field starts recording (no 変更… button); a second click or Esc cancels.
+                    .contentShape(Rectangle())
+                    .onTapGesture { toggleRecording() }
+                    .accessibilityAddTraits(.isButton)
+                    .accessibilityHint(recording ? HotkeyText.cancel : HotkeyText.change)
+                    .accessibilityAction { toggleRecording() }
+                    .help(recording ? HotkeyText.cancel : HotkeyText.change)
                 if let defaultCombo {
                     Button(HotkeyText.reset) {
                         recorder.stop()
@@ -313,11 +338,14 @@ struct HotkeyField: View {
                         recorder.clearMessage(id); combo = defaultCombo; recorder.touch()
                     }
                         .disabled(combo == defaultCombo)
+                } else if alignsColumns {
+                    Button(HotkeyText.reset) {}.hidden().accessibilityHidden(true)
                 }
                 if allowsClear {
                     Button(HotkeyText.clear) { recorder.stop(); recorder.clearMessage(id); combo = nil; recorder.touch() }.disabled(combo == nil)
                 }
             }
+            .frame(maxWidth: alignsColumns ? .infinity : nil, alignment: .leading)
             .disabled(!isEnabled && !recording)
             if recorder.messageID == id, !recorder.message.isEmpty {
                 Text(recorder.message).font(.caption).foregroundColor(recorder.messageIsError ? .red : .secondary)
@@ -340,16 +368,17 @@ struct HotkeyFieldHost: View {
     var registered: () -> Bool
     var isEnabled: () -> Bool
     var allowsOption = false
+    var alignsColumns = false
     @ObservedObject private var recorder = HotkeyRecorder.shared
     init(id: String, get: @escaping () -> KeyCombo?, set: @escaping (KeyCombo?) -> Void, defaultCombo: KeyCombo?, allowsClear: Bool,
-         others: @escaping () -> [(String, KeyCombo)], registered: @escaping () -> Bool, isEnabled: @escaping () -> Bool, allowsOption: Bool = false) {
+         others: @escaping () -> [(String, KeyCombo)], registered: @escaping () -> Bool, isEnabled: @escaping () -> Bool, allowsOption: Bool = false, alignsColumns: Bool = false) {
         self.id = id; self.get = get; self.set = set; self.defaultCombo = defaultCombo; self.allowsClear = allowsClear
-        self.others = others; self.registered = registered; self.isEnabled = isEnabled; self.allowsOption = allowsOption
+        self.others = others; self.registered = registered; self.isEnabled = isEnabled; self.allowsOption = allowsOption; self.alignsColumns = alignsColumns
     }
     var body: some View {
         let _ = recorder.revision
         HotkeyField(id: id, combo: Binding(get: get, set: set), defaultCombo: defaultCombo, allowsClear: allowsClear,
-                    others: others(), registered: registered(), isEnabled: isEnabled(), allowsOption: allowsOption)
+                    others: others(), registered: registered(), isEnabled: isEnabled(), allowsOption: allowsOption, alignsColumns: alignsColumns)
     }
 }
 
@@ -359,10 +388,10 @@ extension HotkeyField {
                                    defaultCombo: KeyCombo? = nil, allowsClear: Bool = false,
                                    others: @escaping () -> [(String, KeyCombo)] = { [] },
                                    registered: @escaping () -> Bool = { true }, isEnabled: @escaping () -> Bool = { true },
-                                   allowsOption: Bool = false) -> NSView {
+                                   allowsOption: Bool = false, alignsColumns: Bool = false) -> NSView {
         SettingsHostingPage(observing: HotkeyRecorder.shared) {
             HotkeyFieldHost(id: id, get: get, set: set, defaultCombo: defaultCombo, allowsClear: allowsClear,
-                            others: others, registered: registered, isEnabled: isEnabled, allowsOption: allowsOption)
+                            others: others, registered: registered, isEnabled: isEnabled, allowsOption: allowsOption, alignsColumns: alignsColumns)
         }
     }
 }

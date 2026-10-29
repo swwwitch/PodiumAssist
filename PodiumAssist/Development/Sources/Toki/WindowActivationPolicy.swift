@@ -3,7 +3,7 @@ import AppKit
 // Canonical source: Shared/AppStandards/WindowActivationPolicy.swift.
 /// Menu-bar apps appear in ⌘Tab (and the Dock) only while a regular window is open.
 /// Panels such as palettes and the About panel do not count; a hidden app (⌘H) stays listed so it can come back.
-/// Choosing the app in ⌘Tab while its only windows are minimized brings one back (⌘Tab sends no reopen event).
+/// AppSwitcherWindowReveal uses the app-owned main-window action on activation (⌘Tab sends no reopen event).
 enum WindowActivationPolicy {
     nonisolated(unsafe) private static var observers: [NSObjectProtocol] = []
     static func install() {
@@ -15,22 +15,19 @@ enum WindowActivationPolicy {
         observers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { _ in
             DispatchQueue.main.async { update() }
         })
-        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
-            restoreMinimized()
-        })
         update()
     }
     static func restoreMinimized() {
-        let windows = NSApp.windows.filter { !($0 is NSPanel) && $0.canBecomeMain && $0.styleMask.contains(.titled) }
+        let windows = NSApp.windows.filter { !($0 is NSPanel) && ($0.canBecomeMain || $0.isMiniaturized) && $0.styleMask.contains(.titled) }
         guard !windows.contains(where: { $0.isVisible }), let window = windows.first(where: { $0.isMiniaturized }) else { return }
         window.deminiaturize(nil)
     }
-    /// 「Dockとアプリケーションスイッチャーに表示しない」 (DockPresence) keeps the app .accessory even with a window open.
+    /// DockPresence keeps menus available while regular windows exist, including minimized ones.
     static func update() { DockPresence.apply() }
     private static func usualPolicy() -> NSApplication.ActivationPolicy {
         NSApp.isHidden || NSApp.windows.contains(where: counts) ? .regular : .accessory
     }
     private static func counts(_ window: NSWindow) -> Bool {
-        (window.isVisible || window.isMiniaturized) && !(window is NSPanel) && window.canBecomeMain && window.styleMask.contains(.titled)
+        DockPresence.counts(window)
     }
 }

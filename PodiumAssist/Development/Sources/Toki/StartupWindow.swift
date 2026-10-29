@@ -1,10 +1,26 @@
 import AppKit
+import Carbon
 import SwiftUI
 
-/// Persisted independently from login registration and residency. Missing key preserves existing behavior.
+/// Manual launch always shows the main window. Only a login-item launch is quiet.
+/// The retired hideMainWindowAtStartup preference is deliberately ignored.
 enum StartupWindow {
-    static let key = "hideMainWindowAtStartup"
-    static var hidden: Bool { UserDefaults.standard.bool(forKey: key) }
+    nonisolated(unsafe) private static var loginLaunch = false
+    nonisolated(unsafe) private static var explicitlyOpened = false
+
+    static func isLoginEvent(_ event: NSAppleEventDescriptor?) -> Bool {
+        event?.paramDescriptor(forKeyword: keyAEPropData)?.enumCodeValue == keyAELaunchedAsLogInItem
+    }
+    static func captureLaunch(_ event: NSAppleEventDescriptor? = NSAppleEventManager.shared().currentAppleEvent) {
+        loginLaunch = loginLaunch || isLoginEvent(event)
+    }
+    static var suppressInitialWindow: Bool {
+        captureLaunch()
+        return loginLaunch && !explicitlyOpened
+    }
+    /// Reopen and file delivery take precedence over a pending initial-window gate.
+    static func userRequestedWindow() { explicitlyOpened = true }
+
     static func text(_ ja: String, _ en: String, _ zh: String, _ ko: String) -> String {
         // Japanese-only apps have no localized bundles; keep their settings language consistent.
         let language = Bundle.main.object(forInfoDictionaryKey: "CFBundleLocalizations") == nil ? "ja" : (Bundle.main.preferredLocalizations.first ?? "en")
@@ -13,41 +29,71 @@ enum StartupWindow {
         if language.hasPrefix("ko") { return ko }
         return en
     }
-    static var title: String { text("起動時にメインウインドウを表示しない", "Hide main window at startup", "启动时不显示主窗口", "시작 시 메인 윈도우 표시 안 함") }
-    static var detail: String { text("メインウインドウを開かずに起動します。起動後はDockやメニューから表示できます。", "Launch without opening the main window. Show it later from the Dock or menu.", "启动时不打开主窗口。之后可从 Dock 或菜单显示。", "메인 윈도우를 열지 않고 시작합니다. Dock 또는 메뉴에서 다시 표시할 수 있습니다.") }
+    static var detail: String { text("ログイン時の自動起動ではメインウインドウを表示しません。手動で起動・開き直したときや、⌘Tabで選択したときは表示します。", "Automatic login launch does not show the main window. Opening or reopening the app manually, or selecting it with ⌘Tab, shows the main window.", "登录时自动启动不显示主窗口。手动启动、重新打开应用或使用 ⌘Tab 选择应用时显示主窗口。", "로그인 시 자동 실행할 때는 메인 윈도우를 표시하지 않습니다. 수동 실행, 다시 열기 또는 ⌘Tab으로 앱을 선택하면 메인 윈도우를 표시합니다.") }
 }
 
-/// Keeps the app out of the Dock and the ⌘Tab switcher (activation policy .accessory). Missing key keeps the usual policy.
-/// Menu-bar apps get their window-dependent policy from WindowActivationPolicy; other apps are .regular.
-/// Applied at launch by MenuBarPresence.install and right away when the setting changes.
+/// Hide background presence, but keep the application menu available for regular windows.
+/// A minimized window stays listed so Dock/⌘Tab can restore it. Palettes never opt in.
 enum DockPresence {
     static let key = "hideFromDockAndAppSwitcher"
     static var hidden: Bool { UserDefaults.standard.bool(forKey: key) }
     nonisolated(unsafe) static var usualPolicy: () -> NSApplication.ActivationPolicy = { .regular }
+    nonisolated(unsafe) private static var observers: [NSObjectProtocol] = []
+    nonisolated(unsafe) private static var applying = false
+    nonisolated(unsafe) private static var minimizing = NSHashTable<NSWindow>.weakObjects()
     static var title: String { StartupWindow.text("Dockとアプリケーションスイッチャーに表示しない", "Hide from Dock and App Switcher", "不在程序坞和应用程序切换器中显示", "Dock 및 앱 전환기에 표시 안 함") }
-    static var detail: String { StartupWindow.text("Dockと⌘Tabの切り替えにアイコンを出しません。メニューバーのアイコンや、Finderからアプリを開き直すと表示できます。", "Keeps the app out of the Dock and the ⌘Tab switcher. Show it from the menu bar icon or by opening the app again in Finder.", "不在程序坞和 ⌘Tab 切换器中显示图标。可通过菜单栏图标或在访达中再次打开应用来显示。", "Dock과 ⌘Tab 전환기에 아이콘을 표시하지 않습니다. 메뉴 막대 아이콘이나 Finder에서 앱을 다시 열어 표시할 수 있습니다.") }
+    static var detail: String { StartupWindow.text("メイン・設定ウインドウがある間は、アプリメニューを使えるようDockと⌘Tabに表示します。最小化中も表示を保ち、対象ウインドウをすべて閉じると隠します。メニューバーのアイコンやFinderから開き直せます。", "While a main or settings window is open, the app appears in the Dock and ⌘Tab so its menus remain available. Minimized windows stay listed. Close all such windows to hide it; reopen from the menu bar icon or Finder.", "主窗口或设置窗口打开时，应用会显示在程序坞和 ⌘Tab 中，以便使用应用菜单。最小化时仍保留显示；关闭所有此类窗口后隐藏。可通过菜单栏图标或访达重新打开。", "메인 또는 설정 윈도우가 열려 있는 동안 앱 메뉴를 사용할 수 있도록 Dock과 ⌘Tab에 표시합니다. 최소화 중에도 유지하며 해당 윈도우를 모두 닫으면 숨깁니다. 메뉴 막대 아이콘이나 Finder에서 다시 열 수 있습니다.") }
+    static func counts(_ window: NSWindow) -> Bool {
+        (window.isVisible || window.isMiniaturized || minimizing.contains(window)) && !(window is NSPanel)
+            && (window.canBecomeMain || window.isMiniaturized || minimizing.contains(window)) && window.styleMask.contains(.titled)
+    }
+    private static func observeWindows() {
+        guard observers.isEmpty else { return }
+        let center = NotificationCenter.default
+        // didUpdate covers orderFront/orderOut as well as SwiftUI-created settings windows.
+        for name in [NSApplication.didUpdateNotification, NSWindow.didBecomeKeyNotification,
+                     NSWindow.didDeminiaturizeNotification,
+                     NSWindow.didChangeOcclusionStateNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in apply() })
+        }
+        observers.append(center.addObserver(forName: NSWindow.willMiniaturizeNotification, object: nil, queue: .main) { note in
+            if let window = note.object as? NSWindow, counts(window) { minimizing.add(window) }
+            apply()
+        })
+        observers.append(center.addObserver(forName: NSWindow.didMiniaturizeNotification, object: nil, queue: .main) { note in
+            if let window = note.object as? NSWindow { minimizing.remove(window) }
+            apply()
+        })
+        observers.append(center.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { note in
+            if let window = note.object as? NSWindow { minimizing.remove(window) }
+            // willClose arrives before isVisible changes, including while another app is active.
+            DispatchQueue.main.async { apply() }
+        })
+    }
     static func apply() {
-        let wanted: NSApplication.ActivationPolicy = hidden ? .accessory : usualPolicy()
+        observeWindows()
+        guard !applying else { return }
+        applying = true
+        defer { applying = false }
+        let wanted: NSApplication.ActivationPolicy = hidden
+            ? (NSApp.windows.contains(where: counts) ? .regular : .accessory) : usualPolicy()
         if NSApp.activationPolicy() != wanted { NSApp.setActivationPolicy(wanted) }
+        // Window notifications must not activate this app or steal focus from another app.
     }
     static func set(_ value: Bool) {
         UserDefaults.standard.set(value, forKey: key)
         apply()
-        // Switching the policy can send the app behind other apps; keep the settings window in front.
+        // A user action in settings may change policy; keep that existing window in front.
         DispatchQueue.main.async { NSApp.activate(ignoringOtherApps: true) }
     }
 }
 
 @MainActor
 final class StartupWindowControl: NSStackView {
-    private let toggle = NSButton(checkboxWithTitle: StartupWindow.title, target: nil, action: nil)
     private let dockToggle = NSButton(checkboxWithTitle: DockPresence.title, target: nil, action: nil)
     init() {
         super.init(frame: .zero)
         orientation = .vertical; alignment = .leading; spacing = 6
-        toggle.state = StartupWindow.hidden ? .on : .off
-        toggle.target = self; toggle.action = #selector(changed)
-        addArrangedSubview(toggle)
         addArrangedSubview(note(StartupWindow.detail))
         dockToggle.state = DockPresence.hidden ? .on : .off
         dockToggle.target = self; dockToggle.action = #selector(dockChanged)
@@ -60,16 +106,13 @@ final class StartupWindowControl: NSStackView {
         detail.font = .systemFont(ofSize: 11); detail.textColor = .secondaryLabelColor
         return detail
     }
-    @objc private func changed() { UserDefaults.standard.set(toggle.state == .on, forKey: StartupWindow.key) }
     @objc private func dockChanged() { DockPresence.set(dockToggle.state == .on) }
 }
 
 struct StartupWindowView: View {
-    @AppStorage(StartupWindow.key) private var hidden = false
     @AppStorage(DockPresence.key) private var dockHidden = false
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Toggle(StartupWindow.title, isOn: $hidden)
             Text(StartupWindow.detail).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle(DockPresence.title, isOn: Binding(get: { dockHidden }, set: { DockPresence.set($0) }))
             Text(DockPresence.detail).font(.caption).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -87,9 +130,62 @@ struct StartupWindowGate: NSViewRepresentable {
             super.viewDidMoveToWindow()
             guard let window, !Self.applied else { return }
             Self.applied = true
-            guard StartupWindow.hidden else { return }
-            window.orderOut(nil)
-            DispatchQueue.main.async { window.orderOut(nil) }
+            // SwiftUI may attach the view before the initial Apple event is delivered.
+            NotificationCenter.default.addObserver(self, selector: #selector(finishedLaunching),
+                name: NSApplication.didFinishLaunchingNotification, object: nil)
+            hideInitialWindowIfNeeded()
         }
+        @objc private func finishedLaunching() {
+            NotificationCenter.default.removeObserver(self, name: NSApplication.didFinishLaunchingNotification, object: nil)
+            hideInitialWindowIfNeeded()
+        }
+        private func hideInitialWindowIfNeeded() {
+            guard let window, StartupWindow.suppressInitialWindow else { return }
+            window.orderOut(nil)
+            DispatchQueue.main.async {
+                guard StartupWindow.suppressInitialWindow else { return }
+                window.orderOut(nil)
+            }
+        }
+    }
+}
+
+/// ⌘Tab activates the app without sending applicationShouldHandleReopen.
+/// Use the same app-owned main-window action as the menu-bar item.
+@MainActor
+enum AppSwitcherWindowReveal {
+    private static var observers: [NSObjectProtocol] = []
+    private static var ready = false
+    private static var auxiliaryActivation = false
+    private static var reveal: (() -> Void)?
+    /// An explicit settings/help action from a status menu owns the next activation.
+    nonisolated static func preserveAuxiliaryWindowOnActivation() {
+        MainActor.assumeIsolated {
+            if !NSApp.isActive { auxiliaryActivation = true }
+        }
+    }
+    static func install(show: @escaping () -> Void) {
+        reveal = show
+        guard observers.isEmpty else { return }
+        ready = NSApp.isRunning
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(forName: NSApplication.didFinishLaunchingNotification, object: NSApp, queue: .main) { _ in
+            // Initial activation belongs to launch policy, particularly quiet login launch.
+            DispatchQueue.main.async { ready = true }
+        })
+        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: NSApp, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                let mouseActivation = NSEvent.pressedMouseButtons != 0
+                let showMain = !auxiliaryActivation
+                auxiliaryActivation = false
+                guard ready, !mouseActivation, showMain else { return }
+                DispatchQueue.main.async {
+                    guard NSApp.isActive, NSApp.modalWindow == nil,
+                          !NSApp.windows.contains(where: { $0.attachedSheet != nil }) else { return }
+                    StartupWindow.userRequestedWindow()
+                    reveal?()
+                }
+            }
+        })
     }
 }
