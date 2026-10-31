@@ -24,3 +24,8 @@ macOS、XcodeのCommand Line Tools、Python 3が必要です。配布ビルド�
 ## 元の履歴
 
 [ソースの出所と今回の変更](SOURCE-ORIGIN.md)に元コミットと検証範囲を記載しています。配布済みバイナリとソースの更新は別に管理しています。
+
+
+## 3.3.19 (build 99) - 2026-11-01
+
+Shift+Up/Down adjusts timer times by ten minutes. Automatic zoom uses logical screen height / 500 as minimum and twice that as maximum. Zoom controls safely reveal System Settings sliders and verify saved factors. Updated flat icon.
