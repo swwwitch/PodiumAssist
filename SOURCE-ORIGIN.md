@@ -38,3 +38,7 @@
 ## 2026-11-01 - PodiumAssist 3.3.19 (build 99)
 
 Canonical source commit `5082c0695e8b7ff054bb3205be0401fdba1e982f` in swwwitch/macos-apps. Preserves individual repository history and build entry points. Includes timer Shift+arrow 10-minute changes, zoom min/max controls and automatic factors, safe System Settings scrolling/knob targeting/saved-value verification, and new flat icon. Distribution app/DMG notarized and verified; installed automatic zoom and manual slider changes tested. Source build and publication evidence recorded separately.
+
+## 2026-11-18 — PodiumAssist 3.3.19 (build 101)
+
+Canonical source commit `fa898887f05f08d3b647f3fa24f4ac9d70850bea` in swwwitch/macos-apps. Both zoom sliders use a fixed 1–15 scale. The Developer ID signed app and DMG were notarized and verified, and the installed app displayed both scales.
